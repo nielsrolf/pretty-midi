@@ -55,6 +55,8 @@ class Instrument(object):
         self.notes = []
         self.pitch_bends = []
         self.control_changes = []
+        # Cached synthesizing
+        self.synthesized = np.array([])
 
     def get_onsets(self):
         """Get all onsets of all notes played by this instrument.
@@ -428,6 +430,98 @@ class Instrument(object):
             # Add in envelope'd waveform to the synthesized signal
             synthesized[start:end] += envelope*note_waveform
 
+        self.synthesized = synthesized
+        return synthesized
+
+    def append_and_synthesize(self, note, fs=44100, wave=np.sin):
+        """Extend a synthesized wav with all events that happened after ``event_counter``
+
+        Parameters
+        ----------
+        note: Note
+            Note to append
+        fs : int
+            Sampling rate of the synthesized audio signal.
+        wave : function
+            Function which returns a periodic waveform,
+            e.g. ``np.sin``, ``scipy.signal.square``, etc.
+
+        Returns
+        -------
+        synthesized : np.ndarray
+            Waveform of the MIDI data, synthesized at ``fs``.
+
+        """
+        self.notes.append(note)
+
+        synthesized = np.zeros(int(fs*(self.get_end_time() + 1)))
+        synthesized[:len(self.synthesized)] = self.synthesized
+
+        # If we're a percussion channel, just return the zeros
+        if self.is_drum:
+            self.synthesized = synthesized
+            return synthesized
+        # If the above if statement failed, we need to revert back to default
+        if not hasattr(wave, '__call__'):
+            raise ValueError('wave should be a callable Python function')
+        # This is a simple way to make the end of the notes fade-out without
+        # clicks
+        fade_out = np.linspace(1, 0, int(.1*fs))
+        # Create a frequency multiplier array for pitch bend
+        bend_multiplier = np.ones(synthesized.shape)
+        # Need to sort the pitch bend list for the loop below to work
+        ordered_bends = sorted(self.pitch_bends, key=lambda bend: bend.time)
+        # Add in a bend of 0 at the end of time
+        end_bend = PitchBend(0, self.get_end_time())
+        for start_bend, end_bend in zip(ordered_bends,
+                                        ordered_bends[1:] + [end_bend]):
+            # Bend start and end time in samples
+            start = int(start_bend.time*fs)
+            end = int(end_bend.time*fs)
+            # The multiplier will be (twelfth root of 2)^(bend semitones)
+            bend_semitones = pitch_bend_to_semitones(start_bend.pitch)
+            bend_amount = (2**(1/12.))**bend_semitones
+            # Sample indices effected by the bend
+            bend_multiplier[start:end] = bend_amount
+        # Add in waveform for note
+        # Indices in samples of this note
+        start = int(fs*note.start)
+        end = int(fs*note.end)
+        # Get frequency of note from MIDI note number
+        frequency = note_number_to_hz(note.pitch)
+        # When a pitch bend gets applied, there will be a sample
+        # discontinuity. So, we also need an array of offsets which get
+        # applied to compensate.
+        offsets = np.zeros(end - start)
+        for bend in ordered_bends:
+            bend_sample = int(bend.time*fs)
+            # Does this pitch bend fall within this note?
+            if bend_sample > start and bend_sample < end:
+                # Compute the average bend so far
+                bend_so_far = bend_multiplier[start:bend_sample].mean()
+                bend_amount = bend_multiplier[bend_sample]
+                # Compute the offset correction
+                offset = (bend_so_far - bend_amount)*(bend_sample - start)
+                # Store this offset for samples effected
+                offsets[bend_sample - start:] = offset
+        # Compute the angular frequencies, bent, over this interval
+        frequencies = 2*np.pi*frequency*(bend_multiplier[start:end])/fs
+        # Synthesize using wave function at this frequency
+        note_waveform = wave(frequencies*np.arange(end - start) +
+                                2*np.pi*frequency*offsets/fs)
+        # Apply an exponential envelope
+        envelope = np.exp(-np.arange(end - start)/(1.0*fs))
+        # Make the end of the envelope be a fadeout
+        if envelope.shape[0] > fade_out.shape[0]:
+            envelope[-fade_out.shape[0]:] *= fade_out
+        else:
+            envelope *= np.linspace(1, 0, envelope.shape[0])
+        # Multiply by velocity (don't think it's linearly scaled but
+        # whatever)
+        envelope *= note.velocity
+        # Add in envelope'd waveform to the synthesized signal
+        synthesized[start:end] += envelope*note_waveform
+        self.synthesized = synthesized
         return synthesized
 
     def fluidsynth(self, fs=44100, sf2_path=None):
